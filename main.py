@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +18,7 @@ import json
 from ultralytics import YOLO
 import logging
 import asyncio
+import io
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -99,6 +100,14 @@ async def read_root(request: Request):
         logger.error(f"Error serving template: {str(e)}")
         raise HTTPException(status_code=500, detail="Error loading the page")
 
+@app.get("/dashboard", response_class=HTMLResponse)
+async def read_dashboard(request: Request):
+    try:
+        return templates.TemplateResponse("dashboard.html", {"request": request})
+    except Exception as e:
+        logger.error(f"Error serving dashboard template: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error loading the dashboard")
+
 @app.get("/users")
 def read_users(db: Session = Depends(get_db)):
     users = db.query(User).all()
@@ -160,7 +169,7 @@ async def detect_ppe(
             shutil.copyfileobj(file.file, buffer)
         
         # Check if file is a video
-        is_video = file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))
+        is_video = file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))
         result_url = None  # Initialize result_url
         
         if is_video:
@@ -350,9 +359,6 @@ async def detect_ppe(
         db.commit()
         db.refresh(detection_log)
         
-        # Get relative path for the result image
-        relative_result_path = os.path.join("results", f"result_{os.path.basename(file_path)}")
-        
         return {
             "message": "Detection completed",
             "log_id": detection_log.id,
@@ -421,4 +427,73 @@ async def update_ppe_settings(
     db_settings.detect_goggles = settings.detect_goggles
     
     db.commit()
-    return {"message": "Settings updated successfully"} 
+    return {"message": "Settings updated successfully"}
+
+# Add these variables at the top with other global variables
+video_capture = None
+is_capturing = False
+
+class VideoCaptureRequest(BaseModel):
+    ip_address: str
+
+@app.post("/start_video")
+async def start_video(request: VideoCaptureRequest):
+    global video_capture, is_capturing
+    
+    try:
+        if video_capture is not None:
+            video_capture.release()
+
+        print(f'ip_address: {request.ip_address}')
+        
+        video_capture = cv2.VideoCapture(request.ip_address)
+        if not video_capture.isOpened():
+            raise HTTPException(status_code=400, detail="Could not open video stream")
+        
+        is_capturing = True
+        return {"message": "Video capture started successfully"}
+    except Exception as e:
+        if video_capture is not None:
+            video_capture.release()
+            video_capture = None
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get_frame")
+async def get_frame():
+    global video_capture, is_capturing
+    
+    if not is_capturing or video_capture is None:
+        logger.error("Video capture not started or video_capture is None")
+        raise HTTPException(status_code=400, detail="Video capture not started")
+    
+    try:
+        ret, frame = video_capture.read()
+        if not ret:
+            logger.error("Could not read frame from video capture")
+            raise HTTPException(status_code=400, detail="Could not read frame")
+        
+        # Log frame dimensions
+        logger.debug(f"Frame dimensions: {frame.shape}")
+        
+        # Convert frame to JPEG
+        _, buffer = cv2.imencode('.jpg', frame)
+        return StreamingResponse(
+            io.BytesIO(buffer.tobytes()),
+            media_type="image/jpeg"
+        )
+    except Exception as e:
+        logger.error(f"Error in get_frame: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/stop_video")
+async def stop_video():
+    global video_capture, is_capturing
+    
+    try:
+        if video_capture is not None:
+            video_capture.release()
+            video_capture = None
+        is_capturing = False
+        return {"message": "Video capture stopped successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) 
